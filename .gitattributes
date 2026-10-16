@@ -1,0 +1,4 @@
+# Keep Windows scripts byte-exact: batch and PowerShell must stay CRLF.
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.md  text eol=lf
