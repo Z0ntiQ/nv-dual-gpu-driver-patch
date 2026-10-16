@@ -1,206 +1,213 @@
-# NVIDIA Dual-GPU: Tesla V100 + GeForce RTX 2060 на одном Windows-сервере
+# nv-dual-gpu-driver-patch
 
-Однонажателевый инструмент, который заставляет GeForce-карту и Tesla/Quadro-карту
-работать **одновременно на одном Windows-хосте**, используя **один и тот же
-датацентровый драйвер** (один `nvlddmkm.sys`).
+Патч INF датацентрового драйвера NVIDIA для одновременной работы GeForce-карты и Tesla/Quadro-карты на одном Windows-хосте под одним `nvlddmkm.sys`.
 
-Рабочий случай, на котором всё проверено: **Tesla V100-PCIE-32GB** (под Strata)
-+ **GeForce RTX 2060** (под ComfyUI), Windows 10 Pro build 19041, драйвер
-NVIDIA **582.78** (ветка 580, `32.0.15.8278`).
+## Проверенная конфигурация
 
----
-
-## 1. Проблема
-
-В Windows для NVIDIA загружается **ровно один** ядерный модуль `nvlddmkm.sys` на
-всю систему — независимо от количества карт. Отсюда жёсткое следствие:
-
-- **Tesla V100** официально обслуживается только **датацентровой** веткой драйвера.
-- **GeForce RTX 2060** официально обслуживается только **Game Ready / Studio** веткой.
-- Поставить два разных драйвера нельзя: победит один `nvlddmkm.sys`, вторая карта
-  уйдёт в **Code 43** (сбой инициализации) или **Code 31** (нет подходящего драйвера).
-
-На живом сервере это выглядело так:
-
-| Карта | Что происходило |
+| Компонент | Значение |
 |---|---|
-| Tesla V100 | Работала на датацентровом `32.0.15.8278` (`nv_dispwi.inf`) |
-| RTX 2060 | **Code 31** — Windows видела осиротевший GeForce-пакет `32.0.15.6094` (ветка 560), но его `nvlddmkm.sys` конфликтует с уже загруженным `8278` |
+| ОС | Windows 10 Pro, build 19041, x64 |
+| Драйвер | NVIDIA **Data Center Driver for Windows 582.78**, WHQL |
+| Версия пакета в Windows | `32.0.15.8278` |
+| Пакет драйвера | `nv_dispwi.inf` |
+| Ветка | 580 |
+| CUDA Toolkit | 13.0 |
+| Дата релиза драйвера | 03.08.2026 |
+| Размер установщика | 725.13 MB |
+| Поддерживаемые ОС драйвера | Windows 10 64-bit, Windows 11 |
+| GPU 1 | Tesla V100-PCIE-32GB (`DEV_1DB6`) |
+| GPU 2 | GeForce RTX 2060 (`DEV_1F03`, `SUBSYS_886D1043`) |
 
-То есть проблема была **не в железе и не в питании**, а в конфликте версий одного и
-того же ядерного модуля.
+Официальная страница драйвера 582.78: **https://www.nvidia.com/en-us/drivers/details/274952/**
 
-## 2. Почему официальные пути не подходили
+## Проблема
 
-| Вариант | Почему отвергнут |
-|---|---|
-| Поставить GeForce-драйвер | V100 уходит в Code 43, Strata падает |
-| Linux (одна ветка 580 на обе карты) | Чисто, но вся связка Strata/ComfyUI уже живёт на Windows |
-| Заменить 2060 на T4/Quadro | Устраивало бы официально, но карта уже куплена |
-| Hyper-V DDA / GPU passthrough в ВМ | Тяжёлая перестройка сервера ради второй карты |
+Windows загружает один `nvlddmkm.sys` на систему. Tesla V100 обслуживается только датацентровой веткой, GeForce RTX 2060 — только Game Ready. Пакет Game Ready (`32.0.15.6094`, ветка 560) конфликтует по версии ядра с загруженным датацентровым (`32.0.15.8278`) → RTX 2060 в Code 31.
 
-## 3. Выбранный метод (неофициальный, но рабочий)
+## Метод
 
-Идея: **не трогать ядро драйвера вообще**. Оставить датацентровый `582.78` как
-единственный `nvlddmkm.sys`, а GeForce-карте дать **INF**, который объявляет её
-hardware ID и указывает на ту же секцию, что и уже поддерживаемая карта **той же
-чип-семейства**.
+Ядро драйвера не модифицируется. В копию INF живого датацентрового пакета добавляется hardware ID GeForce-карты с привязкой к секции датацентр-карты того же чип-семейства. RTX 2060 (TU106) и Tesla T4 (`DEV_1EB8`) — оба Turing; ядро 582.78 поддерживает чип, INF фильтрует ID.
 
-Ключ к совместимости: **RTX 2060 = TU106 (Turing)**. В датацентровом INF уже есть
-**Tesla T4 (`DEV_1EB8`)** — тоже Turing. Значит 2060 можно прикрепить к **той же
-секции `Section046`**, что и T4: ядру драйвера не нужно ничего нового, оно уже
-умеет Turing.
-
-Пошагово:
-
-1. **Взять живой WHQL-пакет** датацентрового драйвера из `DriverStore\FileRepository`
-   (тот, что содержит `DEV_1DB6` = V100): `nv_dispwi.inf_amd64_8d8f1e8d3dd7de47`.
-2. **Прописать hardware ID 2060** в `[NVIDIA_Devices.NTamd64...]`:
+1. Копия пакета из `C:\Windows\System32\DriverStore\FileRepository` (пакет, содержащий `DEV_1DB6`).
+2. В секции `[NVIDIA_Devices.NTamd64...]` после строки донора:
    ```
    %NVIDIA_DEV.1F03.886D.1043% = Section046, PCI\VEN_10DE&DEV_1F03&SUBSYS_886D1043
    ```
-   и строку в `[Strings]`:
+   В `[Strings]`:
    ```
    NVIDIA_DEV.1F03.886D.1043 = "NVIDIA GeForce RTX 2060"
    ```
-   Токен — по конвенции NVIDIA: `NVIDIA_DEV.<dev>.<subsys-device>.<subsys-vendor>`,
-   `SUBSYS_886D1043` → `886D` + `1043`.
-3. **Пересобрать каталог** `.cat` под точным именем из INF (`CatalogFile = NV_DISP.CAT`)
-   через WDK `makecat.exe` + CDF.
-4. **Подписать каталог** локальной цепочкой из двух сертификатов
-   (см. §4 — это была самая неочевидная часть).
-5. **Включить test signing**, перезагрузиться, **установить** пакет
-   `pnputil /add-driver ... /install`.
-6. **Выключить test signing обратно** (см. §5) и убрать следы.
+   Формат токена: `NVIDIA_DEV.<dev>.<subsys-device>.<subsys-vendor>`. `SUBSYS_886D1043` → `886D` + `1043`.
+3. Пересборка каталога под именем из INF (`CatalogFile = NV_DISP.CAT`) через WDK `makecat.exe` + CDF.
+4. Подпись каталога двухуровневой цепочкой: CA root (`BasicConstraints=CA=true`, в `Root` + `TrustedPublisher` + `CA`) → leaf (`CA=false`, EKU KMCS `1.3.6.1.4.1.311.10.3.5` + Code Signing, в `TrustedPublisher`); подписывает leaf.
+5. `bcdedit /set testsigning on`, перезагрузка, `pnputil /add-driver <inf> /install`.
+6. `bcdedit /set testsigning off` + перезагрузка. `nvlddmkm.sys` остаётся оригинальным WHQL-файлом NVIDIA; подпись каталога проверяется при установке, поэтому тестовый режим после установки не требуется.
 
-## 4. Подпись: где было больше всего крови
+Не проходят: self-signed без CA в `Root` (`0x800b0109` → `0xE0000242`), подпись каталога CA-сертификатом напрямую (`0x80096019`), `signtool` без `/sc LocalMachine` (ключ в машинном `My`).
 
-Редактирование INF ломает подпись каталога, а Windows не берёт неподписанный
-ядерный пакет. Перебрал несколько схем подписи, вот что **не** работало и почему:
+## Требования
 
-| Попытка | Ошибка | Причина |
-|---|---|---|
-| `New-SelfSignedCertificate` без CA, кинуть в `Root` | `0x800b0109 → 0xE0000242` «publisher not trusted» | сертификат **не CA**, цепочка не может в нём замкнуться |
-| Один CA-сертификат подписывает `.cat` | `0x80096019` (basic constraint) | файл не может подписывать CA-сертификат |
-| `signtool` без `/sc LocalMachine` | «no certificate found» | приватный ключ лежит в **машинном** `My`, а не пользовательском |
+- Установленный и работающий датацентровый драйвер 582.78 — [страница загрузки](https://www.nvidia.com/en-us/drivers/details/274952/). Tesla/Quadro-карта видна в `nvidia-smi`.
+- WDK 10 (`makecat.exe` в `C:\Program Files (x86)\Windows Kits\10\bin\10.0.<ver>\x64\`).
+- HVCI / Memory Integrity выключен: `Win32_DeviceGuard.KernelModeCodeIntegrityPolicyEnforcementStatus = 0`. При значении `2` test-signed драйвер не загрузится. Проверка: **Безопасность Windows → Безопасность процессора → Изоляция ядра**.
+- Права администратора.
+- Точка восстановления перед запуском.
 
-Что заработало — **двухуровневая цепочка**:
+## Применение на своей машине
 
-- **CA root** `CN=Hermes Test Root CA`, `BasicConstraints = CA=true`,
-  кладётся в `Root` + `TrustedPublisher` + `CA`.
-- **Leaf** `CN=Hermes NV Mod Signing`, подписан CA-корнем, `CA=false`,
-  EKU **Kernel Mode Code Signing** (`1.3.6.1.4.1.311.10.3.5`) + Code Signing,
-  кладётся в `TrustedPublisher`. Подписывает `.cat` именно он.
+### Шаг 1. Установить датацентровый драйвер
 
-Плюс **test signing** (`bcdedit /set testsigning on`) обязателен на момент
-установки: самодельный сертификат никогда не пройдёт стандартную проверку
-подписи ядра Windows.
+Скачать 582.78 со [страницы NVIDIA](https://www.nvidia.com/en-us/drivers/details/274952/) и установить. Проверить, что Tesla/Quadro-карта видна:
 
-Отдельно: **HVCI / Memory Integrity должен быть выключен** — иначе test-signed
-драйвер не загрузится наглухо. На сервере он был выключен
-(`KernelModeCodeIntegrity = 0`), инструмент это проверяет и предупреждает.
+```powershell
+nvidia-smi --query-gpu=index,name,driver_version --format=csv
+```
 
-## 5. Возврат Windows в нормальное (не тестовое) состояние
+GeForce-карта на этом этапе ожидается в Code 31 или Code 43 — это исходное состояние, которое патч устраняет.
 
-Главное наблюдение, которое это позволило: **модифицируется только INF и `.cat`,
-а `nvlddmkm.sys` остаётся оригинальным WHQL-файлом NVIDIA**. Подпись каталога
-проверяется **в момент установки**, а не при каждой загрузке ядра. Значит после
-успешной установки тестовый режим можно снять.
+### Шаг 2. Узнать hardware ID своей GeForce-карты
 
-Фактический результат на сервере после `bcdedit /set testsigning off` + ребута:
+**Диспетчер устройств → карта → Свойства → Сведения → Идентификаторы оборудования**, либо:
+
+```powershell
+Get-PnpDevice -Class Display | Get-PnpDeviceProperty -KeyName DEVPKEY_Device_HardwareIds |
+  Select Instance,Data | Format-List
+```
+
+Нужны значения `DEV_xxxx` и `SUBSYS_xxxxxxxx`. Пример:
 
 ```
-NVIDIA GeForce RTX 2060      32.0.15.8278   Code 0   OK
-NVIDIA Tesla V100-PCIE-32GB  32.0.15.8278   Code 0   OK
+PCI\VEN_10DE&DEV_1F03&SUBSYS_886D1043&REV_A1
+```
+
+### Шаг 3. Подобрать донора
+
+`DEV_xxxx` своей GeForce-карты должен относиться к чип-семейству, которое ядро датацентрового драйвера уже обслуживает. Донор — датацентр/рабочая станция на том же кремнии; его секция используется для привязки.
+
+| GeForce | Чип | Донор в INF 582.78 | Секция | Статус |
+|---|---|---|---|---|
+| RTX 2060 / 2070 / 2080 / Ti | TU106 / TU104 / TU108 | Tesla T4 `1EB8` | `Section046` | проверено |
+| GTX 1650 / 1660 | TU117 / TU116 | T600 `1FB1`, T400 `1FB2` | `Section052` | не проверялось |
+| RTX 3060 Ti – 3090 | GA102 / GA104 / GA106 | A10 `2236`, A2 `25B6`, RTX A4000 `24B0` | `Section056` / `Section065` | не проверялось |
+| RTX 3050, RTX 3060 12GB | GA107 | аналога в INF нет | — | поддержка чипа не подтверждена |
+| RTX 4060 – 4090 | AD102/103/104/106/107 | RTX 6000 Ada `26B1`, L4 `27B8`, RTX 4000 Ada `27B2` | `Section074` / `076` / `073` | не проверялось |
+| RTX 5070 – 5090 | GB202/203/205/206 | RTX PRO 6000 `2BB1`, RTX PRO 4000 `2C34` | `Section090` / `094` | не проверялось |
+| GTX 1050 – 1080 Ti | GP102/104/106/107 | P40 `1B38`, P4 `1BB3` | `Section026` | не проверялось |
+| GTX 750 – 980 | GM107/117/200/204 | Tesla M60 `13F2`, M40 `17FD` | `Section010` | не проверялось |
+
+Quadro, Tesla и RTX PRO в патче не нуждаются — их ID есть в INF.
+
+Проверка поддержки чипа по живому INF своей машины:
+
+```powershell
+$inf = (Get-ChildItem C:\Windows\System32\DriverStore\FileRepository\nv_disp*.inf_amd64_*\nv_disp*.inf |
+  Select-Object -First 1).FullName
+Select-String -Path $inf -Pattern 'NVIDIA_DEV\.[0-9A-F]{4}' |
+  Select-Object -ExpandProperty Line | Sort-Object -Unique
+```
+
+### Шаг 4. Прогнать DryRun
+
+Проверяет поиск пакета и генерацию строк INF без побочных эффектов:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\patch-nv-dual-gpu.ps1 -Phase DryRun `
+  -TargetHwid "PCI\VEN_10DE&DEV_1F03&SUBSYS_886D1043" -TargetName "NVIDIA GeForce RTX 2060" `
+  -DonorHwid DEV_1EB8 -AnchorHwid DEV_1DB6
+```
+
+Ожидаемый вывод: найден пакет `nv_dispwi.inf_amd64_*`, целевая строка добавлена в секцию донора, токен совпадает с форматом из шага 2.
+
+### Шаг 5. Применить
+
+Правка параметров в начале `patch-nv-dual-gpu.cmd` под свою пару карт, затем двойной клик. Либо запуск напрямую:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\patch-nv-dual-gpu.ps1 -Phase Prep `
+  -TargetHwid "PCI\VEN_10DE&DEV_1F03&SUBSYS_886D1043" -TargetName "NVIDIA GeForce RTX 2060" `
+  -DonorHwid DEV_1EB8 -AnchorHwid DEV_1DB6 -WorkDir "E:\AI\nv_dualgpu"
+```
+
+Фаза `Prep` выполняет: самоповышение → поиск пакета по `-AnchorHwid` → копию в `-WorkDir` → патч INF → создание цепочки сертификатов → пересборку и подпись каталога → `bcdedit /set testsigning on` → регистрацию одноразовой задачи `HermesNvDualGpuInstall` (`ONSTART`, SYSTEM) → перезагрузку.
+
+После перезагрузки задача автоматически выполняет `pnputil /add-driver <inf> /install`, `pnputil /scan-devices`, устанавливает политику Windows Update и удаляет себя. Дождитесь окончания автозагрузки (1–3 минуты).
+
+### Шаг 6. Проверить результат
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\patch-nv-dual-gpu.ps1 -Phase Verify
+```
+
+Ожидаемо: обе карты `DriverVersion = 32.0.15.8278`, `ConfigManagerErrorCode = 0`, обе в `nvidia-smi`.
+
+### Шаг 7. Вернуть систему из тестового режима
+
+Фаза `Prep` оставляет `testsigning on`. Для возврата в обычный режим:
+
+```powershell
+bcdedit /set testsigning off
+shutdown /r /t 5
+```
+
+Проверка после перезагрузки:
+
+```powershell
+bcdedit /enum "{current}" | Select-String testsigning
+bcdedit /enum "{default}"  | Select-String testsigning
+```
+
+Ожидаемо: `testsigning  No` в обоих хранилищах, водяной знак «Test Mode» отсутствует, обе карты остаются Code 0.
+
+### Параметры
+
+| Параметр | По умолчанию | Назначение |
+|---|---|---|
+| `-Phase` | `Prep` | `Prep` / `Install` / `Verify` / `Revert` / `DryRun` |
+| `-TargetHwid` | `PCI\VEN_10DE&DEV_1F03&SUBSYS_886D1043` | hardware ID GeForce-карты |
+| `-TargetName` | `NVIDIA GeForce RTX 2060` | имя в `[Strings]` |
+| `-DonorHwid` | `DEV_1EB8` | датацентр-донор того же чип-семейства |
+| `-AnchorHwid` | `DEV_1DB6` | маркер Tesla-карты в живом пакете |
+| `-WorkDir` | `E:\AI\nv_dualgpu` | каталог копии пакета |
+| `-NoReboot` | выключен | не перезагружать после `Prep` |
+
+## Защита конфигурации
+
+При установке ставится политика:
+
+```
+HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate
+ExcludeWUDriversInQualityUpdate = 1
+```
+
+Windows Update не подменяет пакет драйвера. Откат: значение `0` или удаление параметра. Альтернатива — скрытие пакета драйвера через `wushowhide`.
+
+## Ограничения
+
+- Конфигурация не поддерживается NVIDIA и Microsoft.
+- V100 (Volta) остановлена на ветке 580; ветки GeForce 590+ её не поддерживают. Обновление драйвера выполняется синхронно на обеих картах в пределах поддерживаемой обеими картами ветки, затем патч применяется заново.
+- Установщик GeForce-драйвера NVIDIA поверх этой конфигурации заменяет общий `nvlddmkm.sys` и ломает Tesla-карту.
+- После обновления Windows конфигурацию, как правило, требуется применять заново.
+- Вывод на монитор, NVENC и G-SYNC на GeForce-карте через датацентровый драйвер не проверялись; CUDA и вычислительные нагрузки работают.
+- Порядок индексов CUDA после добавления второй карты меняется; при необходимости фиксируется через `CUDA_VISIBLE_DEVICES`.
+
+## Откат
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\patch-nv-dual-gpu.ps1 -Phase Revert
+```
+
+`pnputil /delete-driver oemNN.inf /uninstall /force` (oemNN ищется сканированием `C:\Windows\INF\oem*.inf` на целевой `DEV_`), удаление тестовых сертификатов `CN=Hermes Test Root CA` и `CN=Hermes NV Mod Signing` из `My` / `Root` / `TrustedPublisher` / `CA`, `bcdedit /set testsigning off`. После перезагрузки — установка официального GeForce-драйвера.
+
+## Проверенное состояние после применения
+
+```
+NVIDIA GeForce RTX 2060      32.0.15.8278  Code 0
+NVIDIA Tesla V100-PCIE-32GB  32.0.15.8278  Code 0
 
 index, name, driver_version, memory.used [MiB]
 0, NVIDIA GeForce RTX 2060, 582.78, 33 MiB
-1, Tesla V100-PCIE-32GB,    582.78, 32375 MiB   <- Strata вернулась на V100
+1, Tesla V100-PCIE-32GB,    582.78, 32332 MiB
+
+bcdedit: testsigning No ({current}, {default})
+Published INF: oem45.inf (32.0.15.8278, содержит DEV_1F03)
 ```
-
-Windows больше **не** в тестовом режиме: нет жёлтого водяного знака «Test Mode»,
-`testsigning` отсутствует в BCD. Обе карты на одном драйвере, Strata на V100.
-
-## 6. Инструмент
-
-```
-patch-nv-dual-gpu.cmd    <- двойной клик: сам поднимает админа, патчит, ребутит
-patch-nv-dual-gpu.ps1    <- логика, фазы: Prep / Install / Verify / Revert / DryRun
-```
-
-Что делает по клику (`patch-nv-dual-gpu.cmd`):
-
-1. Самоповышение до администратора.
-2. Находит живой датацентровый пакет по якорю `DEV_1DB6` (V100).
-3. Патчит INF (добавляет hardware ID цели в секцию донора `DEV_1EB8` = T4).
-4. Создаёт цепочку сертификатов (CA root + KMCS leaf) и публикует её.
-5. Пересобирает `.cat` под точным именем из INF и подписывает leaf-сертификатом.
-6. Включает `testsigning`, регистрирует **одноразовую задачу на SYSTEM** (`ONSTART`),
-   перезагружает машину.
-7. После ребута задача сама ставит пакет `pnputil /add-driver ... /install`,
-   ставит защиту от подмены драйвера Windows Update и удаляет себя.
-
-Полезные режимы:
-
-```powershell
-# только показать, что будет сделано (без сертификатов, без ребута, без установки)
-powershell -File .\patch-nv-dual-gpu.ps1 -Phase DryRun
-
-# проверить текущее состояние обеих карт
-powershell -File .\patch-nv-dual-gpu.ps1 -Phase Verify
-
-# откатить: убрать модифицированный пакет, сертификаты, выключить testsigning
-powershell -File .\patch-nv-dual-gpu.ps1 -Phase Revert
-```
-
-Параметры под другую пару карт (по умолчанию — V100 + RTX 2060):
-
-| Параметр | Значение по умолчанию | Смысл |
-|---|---|---|
-| `-TargetHwid` | `PCI\VEN_10DE&DEV_1F03&SUBSYS_886D1043` | hardware ID GeForce-карты |
-| `-TargetName` | `NVIDIA GeForce RTX 2060` | имя в `[Strings]` |
-| `-DonorHwid` | `DEV_1EB8` | Tesla-донор **того же чип-семейства** (Turing) |
-| `-AnchorHwid` | `DEV_1DB6` | маркер Tesla-карты (V100) в живом пакете |
-| `-WorkDir` | `E:\AI\nv_dualgpu` | куда копируется пакет для патча |
-
-> Для другой GeForce-карты **обязательно** подберите `-DonorHwid` из той же
-> архитектуры (Turing→T4 `1EB8`, Ampere→A2/A16/A40, Ada→RTX 6000 Ada и т.д.),
-> иначе ядру драйвера нечем будет обслуживать чип.
-
-## 7. Защита от поломки
-
-- **Windows Update** может молча подтянуть GeForce-драйвер и вернуть V100 в Code 43.
-  Инструмент ставит политику `ExcludeWUDriversInQualityUpdate = 1`
-  (откат: поставить `0` или удалить ключ). Альтернатива помягче — скрыть конкретный
-  драйвер через «Show or hide updates» (`wushowhide`).
-- **V100 заморожена на ветке 580** (feature EOL, секьюрити-патчи примерно до 2028).
-  Любая будущая GeForce-ветка 590+ V100 не поддерживает. Обновляйте драйвер на обеих
-  картах **синхронно** и только в пределах ветки 580, затем заново прогоняйте инструмент.
-- Не запускайте GeForce-установщик NVIDIA поверх этой конфигурации — он перетрёт общий
-  `nvlddmkm.sys`.
-
-## 8. Ограничения и честные оговорки
-
-- Это **не поддерживается** ни NVIDIA, ни Microsoft. Работает за счёт того, что ядро
-  драйвера Turing уже умеет, а INF просто перестаёт фильтровать GeForce ID.
-- Требуется **WDK 10** на машине (для `makecat.exe`). На сервере:
-  `C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makecat.exe`.
-- Требуется выключенный **HVCI / Memory Integrity**.
-- После обновления Windows или драйвера конфигурацию, скорее всего, придётся
-  прогонять заново.
-- Сделайте **точку восстановления** перед запуском.
-
-## 9. Краткая хронология фактов с живого сервера
-
-- `nvidia-smi` до: только V100, драйвер `582.78`, RTX 2060 = Code 31.
-- Осиротевший GeForce-пакет `32.0.15.6094` (ветка 560) — источник конфликта версий.
-- После патча: обе карты `32.0.15.8278`, обе Code 0, обе в `nvidia-smi`.
-- Опубликованные пакеты после установки: `oem45.inf` (модифицированный `8278`,
-  содержит `DEV_1F03`) привязан к обеим NVIDIA-картам; `oem14.inf` (GR `6094`) отвязан.
-- `testsigning off` + ребут: обе карты живы, Windows вне тестового режима, Strata на V100.
-
----
-
-*Собрано и проверено на реальном сервере (V100 + RTX 2060, Windows 10 build 19041,
-драйвер 582.78). Инструмент создан как повторное средство настройки для будущих
-сборок Windows.*
